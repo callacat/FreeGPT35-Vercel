@@ -1,37 +1,42 @@
-const express = require("express");
-const bodyParser = require("body-parser");
-const axios = require("axios");
-const https = require("https");
-const { randomUUID } = require("crypto");
+export const config = {
+  supportsResponseStreaming: true,
+};
+
+import axios from "axios";
+import https from "https";
+import { encode } from "gpt-3-encoder";
+import { randomUUID } from "crypto";
+import jsSHA from "jssha/dist/sha3";
 
 // Constants for the server and API configuration
-const port = 3040;
 const baseUrl = "https://chat.openai.com";
 const apiUrl = `${baseUrl}/backend-anon/conversation`;
 
-// Initialize global variables to store the session token and device ID
-let token;
-let oaiDeviceId;
-
-// 在vercel运行时记录session创建时间
-let sessionStartTime = new Date();
-// Function to wait for a specified duration
-// const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-
-// Function for authentication
-function authMiddleware(req, res, next) {
-  // Set API-Key, if not set, next()
-  const authToken = process.env.AUTH_TOKEN;
-
-  const reqAuthToken = req.headers.authorization;
-
-  if (!authToken) {
-    next();
-  } else if (reqAuthToken && reqAuthToken === `Bearer ${authToken}`) {
-    next();
-  } else {
-    res.sendStatus(401);
+const userAgent =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
+const cores = [8, 12, 16, 24];
+const screens = [3000, 4000, 6000];
+function getConfig() {
+  const core = cores[Math.floor(Math.random() * cores.length)];
+  const screen = screens[Math.floor(Math.random() * screens.length)];
+  return [core + screen, "" + new Date(), 4294705152, 0, userAgent];
+}
+async function generateAnswer(seed, difficulty) {
+  let hash = null;
+  let config = getConfig();
+  for (let attempt = 0; attempt < 100000; attempt++) {
+    config[3] = attempt;
+    const configBase64 = Buffer.from(JSON.stringify(config)).toString("base64");
+    const hashInput = seed + configBase64;
+    const shaObj = new jsSHA("SHA3-512", "TEXT", { encoding: "UTF8" });
+    shaObj.update(hashInput);
+    const hash = shaObj.getHash("HEX");
+    if (hash.substring(0, difficulty.length) <= difficulty) {
+      return "gAAAAAB" + configBase64;
+    }
   }
+  hash = Buffer.from(`"${seed}"`).toString("base64");
+  return "gAAAAABwQ8Lk5FbGpA2NcR9dShT6gYjU7VxZ4D" + hash;
 }
 
 function GenerateCompletionId(prefix = "cmpl-") {
@@ -87,63 +92,59 @@ const axiosInstance = axios.create({
     pragma: "no-cache",
     referer: baseUrl,
     "sec-ch-ua":
-      '"Google Chrome";v="123", "Not:A-Brand";v="8", "Chromium";v="123"',
+      '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
     "sec-ch-ua-mobile": "?0",
     "sec-ch-ua-platform": '"Windows"',
     "sec-fetch-dest": "empty",
     "sec-fetch-mode": "cors",
     "sec-fetch-site": "same-origin",
-    "user-agent":
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+    "user-agent": userAgent,
   },
 });
 
-// Function to get a new session ID and token from the OpenAI API
-async function getNewSessionId() {
-  let newDeviceId = randomUUID();
-  const response = await axiosInstance.post(
-    `${baseUrl}/backend-anon/sentinel/chat-requirements`,
-    {},
-    {
-      headers: { "oai-device-id": newDeviceId },
-    }
-  );
-  console.log(
-    `System: Successfully refreshed session ID and token. ${
-      !token ? "(Now it's ready to process requests)" : ""
-    }`
-  );
-  sessionStartTime = new Date();
-  oaiDeviceId = newDeviceId;
-  token = response.data.token;
-
-  // console.log("New Token:", token);
-  // console.log("New Device ID:", oaiDeviceId);
-}
-
-// Middleware to enable CORS and handle pre-flight requests
-function enableCORS(req, res, next) {
-  res.header("Access-Control-Allow-Credentials", true);
-  res.header("Access-Control-Allow-Origin", "*");
-  res.header("Access-Control-Allow-Headers", "*");
-  res.header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  if (req.method === "OPTIONS") {
-    return res.status(200).end();
-  }
-  next();
-}
 
 // Middleware to handle chat completions
-async function handleChatCompletion(req, res) {
-  if ((new Date() - sessionStartTime) / 60000 > 1) {
-    await getNewSessionId();
+export default async function handleChatCompletion(req, res) {
+  const host = req.headers.host;
+  // Set CORS headers
+  res.setHeader("Access-Control-Allow-Credentials", true);
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "*");
+
+  if (req.method === "OPTIONS") {
+    res.status(200).end();
+    return;
+  } else if (req.method !== "POST") {
+    res.status(405).end();
+    return;
   }
-  console.log(
-    "Request:",
-    `${req.method} ${req.originalUrl}`,
-    `${req.body?.messages?.length || 0} messages`,
-    req.body.stream ? "(stream-enabled)" : "(stream-disabled)"
-  );
+  const authToken = process.env.AUTH_TOKEN;
+  const reqAuthToken = req.headers.authorization;
+  if (authToken && reqAuthToken !== `Bearer ${authToken}`) {
+    res.status(401).end();
+    return;
+  }
+
+  const oaiDeviceId = randomUUID();
+  let token, proofofwork;
+  try {
+    const myResponse = await axiosInstance.post(
+      `${baseUrl}/backend-anon/sentinel/chat-requirements`,
+      {},
+      {
+        headers: { "oai-device-id": oaiDeviceId },
+      }
+    );
+    token = myResponse.data.token;
+    proofofwork = myResponse.data.proofofwork;
+    console.log(`成功获取 pow 和令牌。`);
+  } catch (error) {
+    console.log("获取令牌出错:", error.message);
+  }
+  const { seed, difficulty } = proofofwork;
+  const proof = await generateAnswer(seed, difficulty);
+
   try {
     const body = {
       action: "next",
@@ -160,14 +161,28 @@ async function handleChatCompletion(req, res) {
       websocket_request_id: randomUUID(),
     };
 
+    let promptTokens = 0;
+    let completionTokens = 0;
+
+    for (let message of req.body.messages) {
+      promptTokens += encode(message.content).length;
+    }
+
     const response = await axiosInstance.post(apiUrl, body, {
       responseType: "stream",
       headers: {
         "oai-device-id": oaiDeviceId,
         "openai-sentinel-chat-requirements-token": token,
+        "Openai-Sentinel-Proof-Token": proof,
       },
     });
-
+    console.log(
+      "Request:",
+      `${req.method} ${req.originalUrl}`,
+      `${req.body?.messages?.length || 0} messages`,
+      req.body.stream ? "(stream-enabled)" : "(stream-disabled)",
+      `oaiResponse: ${response.status} ${response.statusText}`
+    );
     // Set the response headers based on the request type
     if (req.body.stream) {
       res.setHeader("Content-Type", "text/event-stream");
@@ -180,6 +195,7 @@ async function handleChatCompletion(req, res) {
     let fullContent = "";
     let requestId = GenerateCompletionId("chatcmpl-");
     let created = Date.now();
+    let finish_reason = null;
 
     for await (const message of StreamCompletion(response.data)) {
       if (message.match(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}.\d{6}$/)) {
@@ -187,7 +203,8 @@ async function handleChatCompletion(req, res) {
       }
       const parsed = JSON.parse(message);
 
-      let content = parsed?.message?.content?.parts[0] || "";
+      let content = parsed?.message?.content?.parts[0] ?? "";
+      let status = parsed?.message?.status ?? "";
 
       for (let message of req.body.messages) {
         if (message.content === content) {
@@ -195,8 +212,31 @@ async function handleChatCompletion(req, res) {
           break;
         }
       }
+      switch (status) {
+        case "in_progress":
+          finish_reason = null;
+          break;
+        case "finished_successfully":
+          let finish_reason_data =
+            parsed?.message?.metadata?.finish_details?.type ?? null;
+          switch (finish_reason_data) {
+            case "max_tokens":
+              finish_reason = "length";
+              break;
+            case "stop":
+            default:
+              finish_reason = "stop";
+          }
+          break;
+        default:
+          finish_reason = null;
+      }
 
       if (content === "") continue;
+
+      let completionChunk = content.replace(fullContent, "");
+
+      completionTokens += encode(completionChunk).length;
 
       if (req.body.stream) {
         let response = {
@@ -207,10 +247,10 @@ async function handleChatCompletion(req, res) {
           choices: [
             {
               delta: {
-                content: content.replace(fullContent, ""),
+                content: completionChunk,
               },
               index: 0,
-              finish_reason: null,
+              finish_reason: finish_reason,
             },
           ],
         };
@@ -234,7 +274,7 @@ async function handleChatCompletion(req, res) {
                 content: "",
               },
               index: 0,
-              finish_reason: "stop",
+              finish_reason: finish_reason,
             },
           ],
         })}\n\n`
@@ -248,7 +288,7 @@ async function handleChatCompletion(req, res) {
           object: "chat.completion",
           choices: [
             {
-              finish_reason: "stop",
+              finish_reason: finish_reason,
               index: 0,
               message: {
                 content: fullContent,
@@ -257,9 +297,9 @@ async function handleChatCompletion(req, res) {
             },
           ],
           usage: {
-            prompt_tokens: 0,
-            completion_tokens: 0,
-            total_tokens: 0,
+            prompt_tokens: promptTokens,
+            completion_tokens: completionTokens,
+            total_tokens: promptTokens + completionTokens,
           },
         })
       );
@@ -267,16 +307,31 @@ async function handleChatCompletion(req, res) {
 
     res.end();
   } catch (error) {
-    flag = false;
-    // console.log('Error:', error.response?.data ?? error.message);
-    if (!res.headersSent) res.setHeader("Content-Type", "application/json");
-    // console.error('Error handling chat completion:', error);
+    let errorMessages;
+    if (error.response?.status == 429) {
+      console.log("oaiResponse: 429 Too Many Request!");
+      errorMessages = "Too Many Request!";
+    } else if (error.response?.status != undefined) {
+      console.log(
+        "oaiResponse:",
+        error.response?.statusm,
+        error.response?.statusText,
+        error.name
+      );
+      errorMessages = error.response?.statusText;
+    } else {
+      console.log("connect error:", error.message);
+      errorMessages = error.message;
+    }
+    if (!res.headersSent)
+      res.writeHead(error.response?.status ?? 502, {
+        "Content-Type": "application/json",
+      });
     res.write(
       JSON.stringify({
         status: false,
         error: {
-          message:
-            "An error happened, please make sure your request is SFW, or use a jailbreak to bypass the filter.",
+          message: errorMessages,
           type: "invalid_request_error",
           origin: error,
         },
@@ -285,41 +340,3 @@ async function handleChatCompletion(req, res) {
     res.end();
   }
 }
-
-// Initialize Express app and use middlewares
-const app = express();
-app.use(bodyParser.json());
-app.use(enableCORS);
-
-async function init() {
-  await getNewSessionId();
-  // Route to handle POST requests for chat completions
-  app.post("/v1/chat/completions", authMiddleware, handleChatCompletion);
-
-  // 404 handler for unmatched routes
-  app.use((req, res) =>
-    res.status(404).send({
-      status: false,
-      error: {
-        message: `The requested endpoint was not found. please make sure to use "http://localhost:3040/v1" as the base URL.`,
-        type: "invalid_request_error",
-      },
-    })
-  );
-
-  // Start the server and the session ID refresh loop
-  app.listen(port, () => {
-    console.log(`💡 Server is running at http://localhost:${port}`);
-    console.log();
-    console.log(`🔗 Base URL: http://localhost:${port}/v1`);
-    console.log(
-      `🔗 ChatCompletion Endpoint: http://localhost:${port}/v1/chat/completions`
-    );
-    console.log();
-    console.log("📝 Original TS Source By: Pawan.Krd");
-    console.log("📝 Modified Into JavaScript By: Adam");
-    console.log();
-  });
-}
-
-init();
